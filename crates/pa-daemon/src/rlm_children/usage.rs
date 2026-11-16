@@ -1,5 +1,6 @@
 //! The child-usage attribution concern: the per-origin usage batches,
 //! the forget/emit pairing, and the rearming watch loop.
+use super::lifecycle::transient_child_probe_failure;
 use super::retirement::{RetirementEvent, RetirementIntent};
 use super::{
     Arc, ChildRecord, Duration, Instant, Mutex, PathBuf, RlmChildUsageReport,
@@ -277,6 +278,7 @@ impl SupervisorChildSessionsInner {
                 match self.child_busy(&active_session_id).await {
                     Ok(false) => break,
                     Ok(true) => {}
+                    Err(error) if transient_child_probe_failure(&error) => {}
                     Err(_) => {
                         unreachable_polls += 1;
                         if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {
@@ -340,6 +342,9 @@ impl SupervisorChildSessionsInner {
                             self.emit_child_usage(&record).await;
                             unreachable_polls = 0;
                         }
+                        // An overloaded worker is not a dead one: keep the
+                        // usage watch alive for the turn's rows.
+                        Err(error) if transient_child_probe_failure(&error) => {}
                         Err(_) => {
                             unreachable_polls += 1;
                             if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {

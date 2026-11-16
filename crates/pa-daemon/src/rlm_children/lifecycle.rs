@@ -15,6 +15,9 @@ use super::{
     WATCH_POLL_INTERVAL_MS, WATCH_SETTLE_GRACE_MS, WATCH_WAIT_SLICE_MS,
 };
 
+/// Budget for reviving a child whose active id stopped resolving.
+const REVIVE_TIMEOUT_MS: u64 = 5_000;
+
 /// Parsed ids of one created child session.
 struct CreatedSessionIds {
     active_session_id: String,
@@ -401,11 +404,39 @@ impl SupervisorChildSessionsInner {
             id: None,
             active_session_id: active_session_id.to_string(),
             wait_for_rlm_quiescence: Some(true),
+            // The worker answers on its own budget. Without it a client that
+            // stops reading (every re-sliced watch timeout) leaves the
+            // request parked in the worker, holding one in-flight permit
+            // until the child finally goes quiescent.
+            timeout_ms: Some(budget.as_millis() as u64),
             rest: Map::default(),
         };
         let _ = self
             .command(&command, budget.as_millis() as u64 + IDLE_WAIT_GRACE_MS)
             .await;
+    }
+
+    /// Revive a child whose routing id stopped resolving: a bounded
+    /// `wait_for_idle` is a wake-class command, so the supervisor resolves
+    /// the durable selector, launches a worker over the child's session file
+    /// when it was passivated, and records the binding for later reads.
+    /// Returns whether the command found a live resident.
+    async fn revive_child(&self, active_session_id: &str) -> bool {
+        let make_command = |selector: &str| DaemonCommand::WaitForIdle {
+            id: None,
+            active_session_id: selector.to_string(),
+            wait_for_rlm_quiescence: Some(false),
+            timeout_ms: Some(1),
+            rest: Map::default(),
+        };
+        self.command_with_durable_wake(
+            make_command,
+            active_session_id,
+            REVIVE_TIMEOUT_MS,
+            "revive RLM child session",
+        )
+        .await
+        .is_ok()
     }
 
     /// Refresh one record against its worker: settle a child whose worker ran out of work and
@@ -609,9 +640,24 @@ impl SupervisorChildSessionsInner {
             // Still running (a timed-out slice or a re-queued continuation):
             // re-check liveness so a dead worker cannot spin the watch.
             let busy = self.child_busy(&active_session_id).await;
+            let gone = match &busy {
+                Ok(_) => false,
+                // A saturated or restarting worker is not a dead child: the
+                // refusal says "try later", so it must not count toward the
+                // give-up streak. Counting it was how a healthy child that
+                // stayed busy for hours was settled as unreachable.
+                Err(error) if transient_child_probe_failure(error) => false,
+                // The worker was passivated or replaced between the wake and
+                // this read: revive through the durable selector and let the
+                // next pass read the new binding.
+                Err(error) if unknown_child_session(error) => {
+                    !self.revive_child(&active_session_id).await
+                }
+                Err(_) => true,
+            };
             if busy.is_ok() {
                 unreachable_polls = 0;
-            } else {
+            } else if gone {
                 unreachable_polls += 1;
                 if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {
                     // A dead child keeps whatever rows its file already
@@ -897,6 +943,26 @@ impl SupervisorChildSessionsInner {
             );
         }
     }
+}
+
+/// Probe failures that say "not now", never "gone": an overloaded worker or
+/// a supervisor link that is reconnecting. They leave the give-up streak
+/// unchanged; a later successful read resets it. A route that genuinely
+/// times out still counts: the supervisor accepted it and the worker did not
+/// answer within its budget, which is the shape of a wedged worker.
+pub(super) fn transient_child_probe_failure(error: &anyhow::Error) -> bool {
+    let rendered = format!("{error:#}");
+    rendered.contains("is overloaded; retry later")
+        || rendered.contains("supervisor link request timed out")
+        || rendered.contains("supervisor link closed")
+        || rendered.contains("Session worker is not connected")
+        || rendered.contains("Daemon worker socket closed")
+}
+
+/// The selector resolved nowhere: the child was passivated, replaced, or
+/// deleted. Only a failed durable wake proves the session is gone.
+fn unknown_child_session(error: &anyhow::Error) -> bool {
+    format!("{error:#}").starts_with("Unknown active session:")
 }
 
 /// Whether a child may still settle as an error (the failed task prompt's

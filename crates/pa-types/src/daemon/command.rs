@@ -621,6 +621,11 @@ pub enum DaemonCommand {
         /// (the `wait_for_headless_completion` barrier of the same name).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wait_for_rlm_quiescence: Option<bool>,
+        /// Bound the idle park. The worker answers `timedOut: true` instead
+        /// of holding the request past the budget, so a client that gives up
+        /// cannot keep the worker's in-flight permit occupied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
         #[serde(flatten)]
         rest: JsonMap,
     },
