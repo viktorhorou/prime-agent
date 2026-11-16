@@ -1,0 +1,1 @@
+- Fixed healthy subagents being reported as "Child worker unreachable" after long busy runs: idle waits are now bounded, and transient worker overload no longer counts as a dead worker.

@@ -27,6 +27,53 @@ async fn created_dispatch_worker() -> std::sync::Arc<Worker> {
     worker
 }
 
+/// A bounded idle wait answers on its budget instead of parking: an
+/// abandoned client request must release the worker's in-flight permit.
+#[tokio::test]
+async fn a_bounded_wait_for_idle_answers_on_its_budget_while_busy() {
+    let dir = std::env::temp_dir().join(format!("pa-worker-bounded-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = WorkerConfig {
+        socket_path: dir.join("worker.sock"),
+        supervisor_socket_path: std::path::PathBuf::new(),
+        token: "token".to_string(),
+        worker_instance_id: String::new(),
+        active_session_id: "bounded-wait".to_string(),
+        agent_dir: dir.join("agent"),
+        recovery_journal_path: dir.join("recovery.jsonl"),
+        telemetry_disabled: None,
+        script: Some(json!({
+            "responses": [{ "text": "slow turn", "delayMs": 1_000 }]
+        })),
+    };
+    let worker = std::sync::Arc::new(Worker::new(config, None));
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": "/tmp", "name": "bounded" }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    let steered = worker
+        .dispatch("steer", &json!({ "message": "hold the turn busy" }))
+        .await;
+    assert!(steered.success, "steer failed: {steered:?}");
+
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        worker.dispatch("wait_for_idle", &json!({ "timeoutMs": 40 })),
+    )
+    .await
+    .expect("a bounded wait_for_idle must answer instead of parking");
+    assert!(response.success, "wait_for_idle failed: {response:?}");
+    assert_eq!(response.data, Some(json!({ "timedOut": true })));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the answer waits out the requested budget, not the idle turn"
+    );
+}
+
 /// The session events seen by an attached client since `mark`, in
 /// wire order.
 fn session_events_since(

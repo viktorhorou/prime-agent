@@ -593,9 +593,27 @@ impl Worker {
     /// `waitForRlmQuiescence` also holds until its RLM children settled
     /// (the parent-side settle watcher and `collect` wait out a child's
     /// whole subtree this way).
+    ///
+    /// `timeoutMs` bounds the park: a client that re-slices its wait must
+    /// not leave an abandoned request parked here, because the request
+    /// keeps one of the worker's finite in-flight permits until it answers.
     pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
-        self.wait_until_quiescent(payload).await;
-        response_success(None, "wait_for_idle", None)
+        let timeout_ms = payload.get("timeoutMs").and_then(Value::as_u64);
+        let Some(timeout_ms) = timeout_ms.filter(|ms| *ms > 0) else {
+            self.wait_until_quiescent(payload).await;
+            return response_success(None, "wait_for_idle", None);
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            self.wait_until_quiescent(payload),
+        )
+        .await
+        {
+            Ok(()) => response_success(None, "wait_for_idle", None),
+            Err(_elapsed) => {
+                response_success(None, "wait_for_idle", Some(json!({ "timedOut": true })))
+            }
+        }
     }
 
     /// `wait_for_headless_completion` (TS daemon command): settle the

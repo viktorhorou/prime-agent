@@ -37,6 +37,9 @@ enum FakeChild {
     /// The first `get_last_assistant_text` reads no text (the settle raced
     /// the worker's answer hand-off); later reads answer it.
     TextLate,
+    /// Every child liveness read is refused as `worker_overloaded` until
+    /// the test's read budget expires; then the child answers idle.
+    OverloadedUntilHealthy,
     /// The worker leaves right after the settle answer is captured:
     /// every later child read fails.
     LeavesAfterSettle,
@@ -130,6 +133,19 @@ async fn spawn_fake_supervisor(
                     let command = value["command"].clone();
                     let command_type: &str = command["type"].as_str().unwrap_or_default();
                     let response = match command_type {
+                        _ if matches!(
+                            (child, command_type),
+                            (FakeChild::OverloadedUntilHealthy, "get_state")
+                        ) && state_reads.fetch_add(1, Ordering::SeqCst) + 1
+                            <= 2 * WATCH_MAX_UNREACHABLE_POLLS + 10 =>
+                        {
+                            response_failure(
+                                Some(&id),
+                                command_type,
+                                "Session worker child-live is overloaded; retry later",
+                                None,
+                            )
+                        }
                         _ if matches!(
                             (child, command_type),
                             (FakeChild::PromptFails, "prompt")
@@ -1162,6 +1178,40 @@ async fn an_unreachable_child_delivers_the_failure_notice_instead_of_no_reply() 
     // Exactly one failure row lands: the give-up claims once.
     let extra = tokio::time::timeout(Duration::from_millis(300), follow_up_rx.recv()).await;
     assert!(extra.is_err(), "no second notice may arrive");
+}
+
+/// A worker that answers `worker_overloaded` is busy, not gone: repeated
+/// transient refusals must not settle the child as unreachable.
+#[tokio::test(start_paused = true)]
+async fn overloaded_liveness_reads_do_not_settle_a_healthy_child_as_unreachable() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+        }
+    });
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) = sessions_with_fake_supervisor(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::OverloadedUntilHealthy,
+    )
+    .await;
+    spawn_child(&sessions).await;
+    sessions.notify_turn_done();
+
+    let follow_up = tokio::time::timeout(Duration::from_secs(3_600), follow_up_rx.recv())
+        .await
+        .expect("the child settles after the overload clears")
+        .expect("follow_up channel open");
+    assert_ne!(
+        follow_up["customMessage"]["customType"],
+        json!("rlm_child_failure"),
+        "a transient overload is not a dead worker: {follow_up}"
+    );
+    let entries = sessions.list_subagents().await.expect("child roster");
+    assert_eq!(entries[0].status, "completed");
 }
 
 /// Hand-off into the unreachable give-up's poll: the fake parks the
